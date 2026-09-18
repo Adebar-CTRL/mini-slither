@@ -85,6 +85,12 @@
   }
   #roomCodeBox .code { color: var(--accent); font-weight: 700; font-size: 15px; margin-top: 4px; user-select: all; }
   .nameLabel { font-size: 12px; opacity: 0.55; margin-bottom: 6px; }
+  .versionTag {
+    margin-top: 6px;
+    font-size: 12px;
+    opacity: 0.65;
+    letter-spacing: 0.4px;
+  }
 </style>
 </head>
 <body>
@@ -104,6 +110,7 @@
   <div id="overlay">
     <div class="menuscreen active" id="menuMain">
       <h1>🐍 Mini Slither</h1>
+      <div class="versionTag">v1.4</div>
       <p>Ziehe den Finger zum Steuern, linker Knopf zum Boosten.</p>
       <div class="nameLabel">Dein Name</div>
       <input type="text" id="nameInput" maxlength="14" placeholder="Spieler">
@@ -130,13 +137,15 @@
       </div>
       <button id="btnCopyCode" class="secondary">Code kopieren</button>
       <button id="btnHostStart">Spiel starten</button>
+      <button id="btnHostLeave" class="secondary">Lobby verlassen</button>
       <p id="hostPlayerCount" style="margin-top:10px; font-size:13px; opacity:0.7;">0 Mitspieler verbunden</p>
     </div>
 
     <div class="menuscreen" id="menuOver">
       <h1 id="overTitle">💀 Game Over</h1>
       <div class="score" id="finalScore"></div>
-      <button id="btnRestart">Neustart</button>
+      <button id="btnContinue">Weiter spielen</button>
+      <button id="btnRestart" class="secondary">Zurück zum Menü</button>
     </div>
   </div>
 </div>
@@ -156,6 +165,7 @@
   const statusVal = document.getElementById('statusVal');
   const finalScore = document.getElementById('finalScore');
   const overTitle = document.getElementById('overTitle');
+  const btnContinue = document.getElementById('btnContinue');
   const nameInput = document.getElementById('nameInput');
 
   const screens = {
@@ -207,6 +217,7 @@
   let connections = {};
   let latestState = null;
   let lastBroadcast = 0;
+  let pendingRespawn = false;
 
   function rand(a, b) { return a + Math.random() * (b-a); }
   function dist2(ax, ay, bx, by) { const dx = ax-bx, dy = ay-by; return dx*dx+dy*dy; }
@@ -342,13 +353,21 @@
     }
   }
 
-  function endGameLocal(s) {
-    running = false;
-    finalScore.textContent = 'Deine Länge: ' + snakeLength(s);
-    overTitle.textContent = '💀 Game Over';
+  function setInGameUIVisible(visible) {
+    hud.style.display = visible ? 'block' : 'none';
+    scoreboard.style.display = visible ? 'block' : 'none';
+    boostBtn.style.display = visible ? 'flex' : 'none';
+    mmCanvas.style.display = visible ? 'block' : 'none';
+  }
+
+  function endGameLocal(s, options = {}) {
+    const canContinue = options.canContinue !== false;
+    if (mode === 'solo') running = false;
+    finalScore.textContent = options.message || ('Deine Länge: ' + snakeLength(s));
+    overTitle.textContent = options.title || '💀 Game Over';
+    btnContinue.style.display = canContinue ? 'inline-block' : 'none';
     showScreen('over');
-    hud.style.display = 'none'; scoreboard.style.display = 'none';
-    boostBtn.style.display = 'none'; mmCanvas.style.display = 'none';
+    setInGameUIVisible(false);
   }
 
   function updateHUD(s) { lenVal.textContent = s ? snakeLength(s) : '-'; }
@@ -483,8 +502,7 @@
       })),
       food: food.map(f => [Math.round(f.x), Math.round(f.y), f.r, f.color])
     };
-    const payload = JSON.stringify(snap);
-    for (const id in connections) { const c = connections[id]; if (c && c.open) c.send(payload); }
+    for (const id in connections) { const c = connections[id]; if (c && c.open) c.send(snap); }
   }
 
   function clientLoop() {
@@ -499,7 +517,13 @@
       if (me) {
         updateHUD(me);
         updateScoreboard(snakeArr.filter(s => s.segs.length>0).map(s => ({ color: s.color, len: s.segs.length, you: s.id===localId, name: s.name })));
-        if (me.alive === false && !gameOverShown) { gameOverShown = true; endGameLocal(me); }
+        if (me.alive === false && !gameOverShown && !pendingRespawn) { gameOverShown = true; endGameLocal(me); }
+        if (me.alive && pendingRespawn) {
+          pendingRespawn = false;
+          gameOverShown = false;
+          showGameUI();
+          statusVal.textContent = 'Client';
+        }
       }
       if (!gameOverShown) draw(snakeArr, foodArr, localId);
     }
@@ -564,8 +588,20 @@
 
   function showGameUI() {
     showScreen(null);
-    hud.style.display = 'block'; scoreboard.style.display = 'block';
-    boostBtn.style.display = 'flex'; mmCanvas.style.display = 'block';
+    setInGameUIVisible(true);
+  }
+
+  function spawnPlayerSnake(id, fallbackName) {
+    const prev = snakes[id];
+    const color = prev ? prev.color : randColor();
+    const name = clampName((prev && prev.name) || fallbackName || 'Spieler');
+    snakes[id] = makeSnake(id, rand(300, WORLD-300), rand(300, WORLD-300), color, false, name);
+    return snakes[id];
+  }
+
+  function updateHostPlayerCount() {
+    const connected = Object.values(connections).filter(c => c && c.open).length;
+    document.getElementById('hostPlayerCount').textContent = connected + ' Mitspieler verbunden';
   }
 
   function startSolo() {
@@ -588,24 +624,34 @@
 
     peer = new Peer();
     document.getElementById('roomCodeText').textContent = 'Verbinde...';
+    updateHostPlayerCount();
     peer.on('open', id => { document.getElementById('roomCodeText').textContent = id; });
     peer.on('connection', conn => {
+      const nid = conn.peer;
+      connections[nid] = conn;
+      if (!snakes[nid]) spawnPlayerSnake(nid, 'Spieler');
+      updateHostPlayerCount();
       conn.on('open', () => {
-        const nid = conn.peer;
-        snakes[nid] = makeSnake(nid, rand(300, WORLD-300), rand(300, WORLD-300), randColor(), false, 'Spieler');
-        connections[nid] = conn;
-        document.getElementById('hostPlayerCount').textContent = Object.keys(connections).length + ' Mitspieler verbunden';
+        updateHostPlayerCount();
       });
       conn.on('data', data => {
-        const s = snakes[conn.peer];
-        if (!s) return;
-        if (data && data.type === 'join') { s.name = clampName(data.name); }
-        else { s.targetDir = data.d; s.boosting = data.b; }
+        if (data && data.type === 'join') {
+          spawnPlayerSnake(nid, data.name).name = clampName(data.name);
+          return;
+        }
+        if (data && data.type === 'respawn') {
+          spawnPlayerSnake(nid, data.name);
+          return;
+        }
+        const s = snakes[nid] || spawnPlayerSnake(nid, 'Spieler');
+        if (!data) return;
+        if (typeof data.d === 'number') s.targetDir = data.d;
+        s.boosting = !!data.b;
       });
       conn.on('close', () => {
         const s = snakes[conn.peer]; if (s) s.alive = false;
         delete connections[conn.peer];
-        document.getElementById('hostPlayerCount').textContent = Object.keys(connections).length + ' Mitspieler verbunden';
+        updateHostPlayerCount();
       });
     });
     peer.on('error', err => { document.getElementById('roomCodeText').textContent = 'Fehler: ' + err.type; });
@@ -628,6 +674,7 @@
 
   function connectToHost(code) {
     mode = 'client'; gameOverShown = false; boostHeld = false; pointer.active = false;
+    pendingRespawn = false;
     document.getElementById('joinStatus').textContent = 'Verbinde...';
     peer = new Peer();
     peer.on('open', myId => {
@@ -640,14 +687,17 @@
         statusVal.textContent = 'Client';
         requestAnimationFrame(clientLoop);
       });
-      hostConn.on('data', data => { latestState = data; });
+      hostConn.on('data', data => {
+        if (typeof data === 'string') {
+          try { latestState = JSON.parse(data); } catch (_) { return; }
+        } else {
+          latestState = data;
+        }
+      });
       hostConn.on('close', () => {
         if (!gameOverShown) {
-          gameOverShown = true; running = false;
-          finalScore.textContent = 'Verbindung zum Host getrennt';
-          overTitle.textContent = '📡 Verbindung verloren';
-          showScreen('over');
-          hud.style.display='none'; scoreboard.style.display='none'; boostBtn.style.display='none'; mmCanvas.style.display='none';
+          gameOverShown = true; running = false; pendingRespawn = false;
+          endGameLocal(null, { title: '📡 Verbindung verloren', message: 'Verbindung zum Host getrennt', canContinue: false });
         }
       });
       hostConn.on('error', () => { document.getElementById('joinStatus').textContent = 'Verbindung fehlgeschlagen.'; });
@@ -658,6 +708,38 @@
   function cleanupNetwork() {
     try { if (peer) peer.destroy(); } catch(e) {}
     peer = null; hostConn = null; connections = {}; latestState = null;
+    pendingRespawn = false;
+  }
+
+  function respawnLocalPlayer() {
+    if (mode === 'solo') {
+      gameOverShown = false;
+      resetWorld(BOT_COUNT_SOLO);
+      snakes[localId] = makeSnake(localId, WORLD/2, WORLD/2, '#58a6ff', false, playerName);
+      running = true;
+      showGameUI();
+      statusVal.textContent = 'Solo';
+      lastTime = performance.now();
+      requestAnimationFrame(simLoop);
+      return;
+    }
+    if (mode === 'host') {
+      gameOverShown = false;
+      snakes[localId] = makeSnake(localId, WORLD/2, WORLD/2, '#58a6ff', false, playerName);
+      showGameUI();
+      statusVal.textContent = 'Host';
+      if (!running) {
+        running = true;
+        lastTime = performance.now();
+        requestAnimationFrame(simLoop);
+      }
+      return;
+    }
+    if (mode === 'client' && hostConn && hostConn.open) {
+      pendingRespawn = true;
+      hostConn.send({ type: 'respawn', name: playerName });
+      finalScore.textContent = 'Respawn angefragt...';
+    }
   }
 
   document.getElementById('btnSolo').addEventListener('click', startSolo);
@@ -670,11 +752,23 @@
     connectToHost(code);
   });
   document.getElementById('btnHostStart').addEventListener('click', beginHostedGame);
+  document.getElementById('btnHostLeave').addEventListener('click', () => {
+    cleanupNetwork();
+    mode = 'menu';
+    running = false;
+    showScreen('main');
+  });
   document.getElementById('btnCopyCode').addEventListener('click', () => {
     const txt = document.getElementById('roomCodeText').textContent;
     if (navigator.clipboard) navigator.clipboard.writeText(txt).catch(()=>{});
   });
-  document.getElementById('btnRestart').addEventListener('click', () => { cleanupNetwork(); showScreen('main'); });
+  btnContinue.addEventListener('click', respawnLocalPlayer);
+  document.getElementById('btnRestart').addEventListener('click', () => {
+    cleanupNetwork();
+    mode = 'menu';
+    running = false;
+    showScreen('main');
+  });
 
   showScreen('main');
 })();
